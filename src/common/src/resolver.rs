@@ -26,7 +26,8 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::constants::SERVER_CONFIG_PATH;
-use crate::db::{Cache, CacheTxn, Db};
+use crate::db::{Cache, CacheTxn, Db, KeyStoreTxn};
+use crate::fingerprint::{self, FingerprintVerification};
 use crate::idprovider::interface::{
     AuthCacheAction,
     AuthCredHandler,
@@ -45,8 +46,10 @@ use crate::unix_config::{HomeAttr, UidAttr};
 use crate::unix_proto::{HomeDirectoryInfo, NssGroup, NssUser, PamAuthRequest, PamAuthResponse};
 
 use kanidm_hsm_crypto::{
-    provider::BoxedDynTpm, structures::HmacS256Key as HmacKey, structures::StorageKey as MachineKey,
+    provider::BoxedDynTpm, structures::HmacS256Key as HmacKey, structures::SealedData,
+    structures::StorageKey as MachineKey,
 };
+use zeroize::Zeroizing;
 
 use tokio::sync::broadcast;
 
@@ -97,6 +100,12 @@ where
     allow_id_overrides: HashSet<Id>,
     nxset: Mutex<HashSet<Id>>,
     nxcache: Mutex<LruCache<Id, SystemTime>>,
+    /// Experimental fingerprint-backed Hello proof of concept. Snapshotted at
+    /// construction from `enable_experimental_biometric_hello`.
+    biometric_hello_enabled: bool,
+    /// Whether Hello TOTP is enabled. Biometric Hello is not offered when it is,
+    /// since a fingerprint would bypass the TOTP second factor.
+    hello_totp_enabled: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -411,6 +420,8 @@ mod tests {
             UidAttr::Name,
             UidAttr::Name,
             Vec::new(),
+            false,
+            false,
         )
         .await
         .expect("failed to create resolver")
@@ -643,6 +654,8 @@ where
         uid_attr_map: UidAttr,
         gid_attr_map: UidAttr,
         allow_id_overrides: Vec<String>,
+        biometric_hello_enabled: bool,
+        hello_totp_enabled: bool,
     ) -> ResolverResult<Self> {
         let hsm = Mutex::new(hsm);
         let mut hsm_lock = hsm.lock().await;
@@ -719,6 +732,8 @@ where
             allow_id_overrides: allow_id_overrides.into_iter().map(Id::Name).collect(),
             nxset: Mutex::new(HashSet::new()),
             nxcache: Mutex::new(LruCache::new(NXCACHE_SIZE)),
+            biometric_hello_enabled,
+            hello_totp_enabled,
         })
     }
 
@@ -731,6 +746,122 @@ where
     /// Import broker PRTs previously exported by [`Self::export_broker_prts`].
     pub async fn import_broker_prts(&self, data: &[u8]) -> Result<(), serde_json::Error> {
         self.client.import_broker_prts(data).await
+    }
+
+    // --- Experimental fingerprint-backed Hello (proof of concept) -----------
+    //
+    // The user's validated Hello PIN is sealed to the machine key after a
+    // successful PIN authentication. A later local login can then verify the
+    // fingerprint via fprintd (in this trusted daemon, never in PAM) and, on a
+    // match, replay the unsealed PIN through the normal PIN path. This trusts
+    // the daemon/root, matching the fprintd trust model: at-rest protection is
+    // preserved (a stolen disk cannot unseal), but a live root peer in a login
+    // context can obtain the sealed PIN.
+
+    fn biometric_pin_tag(account_id: &str) -> String {
+        format!("{}/hello_biometric_pin", account_id.to_lowercase())
+    }
+
+    async fn biometric_pin_sealed(&self, account_id: &str) -> bool {
+        let tag = Self::biometric_pin_tag(account_id);
+        let mut dbtxn = self.db.write().await;
+        matches!(dbtxn.get_tagged_hsm_key::<SealedData>(&tag), Ok(Some(_)))
+    }
+
+    async fn seal_biometric_pin(&self, account_id: &str, pin: &str) {
+        let tag = Self::biometric_pin_tag(account_id);
+        let sealed = {
+            let mut hsm = self.hsm.lock().await;
+            match hsm.seal_data(&self.machine_key, Zeroizing::new(pin.as_bytes().to_vec())) {
+                Ok(sealed) => sealed,
+                Err(err) => {
+                    warn!(?err, "Failed to seal biometric Hello PIN");
+                    return;
+                }
+            }
+        };
+        let mut dbtxn = self.db.write().await;
+        if let Err(err) = dbtxn.insert_tagged_hsm_key(&tag, &sealed) {
+            warn!(?err, "Failed to store biometric Hello PIN");
+            return;
+        }
+        if let Err(err) = dbtxn.commit() {
+            warn!(?err, "Failed to commit biometric Hello PIN");
+        }
+    }
+
+    async fn unseal_biometric_pin(&self, account_id: &str) -> Option<Zeroizing<String>> {
+        let tag = Self::biometric_pin_tag(account_id);
+        let sealed: SealedData = {
+            let mut dbtxn = self.db.write().await;
+            match dbtxn.get_tagged_hsm_key(&tag) {
+                Ok(Some(sealed)) => sealed,
+                Ok(None) => return None,
+                Err(err) => {
+                    warn!(?err, "Failed to read biometric Hello PIN");
+                    return None;
+                }
+            }
+        };
+        let mut hsm = self.hsm.lock().await;
+        match hsm.unseal_data(&self.machine_key, &sealed) {
+            Ok(bytes) => match String::from_utf8(bytes.to_vec()) {
+                Ok(pin) => Some(Zeroizing::new(pin)),
+                Err(err) => {
+                    warn!(?err, "Biometric Hello PIN is not valid UTF-8");
+                    None
+                }
+            },
+            Err(err) => {
+                warn!(?err, "Failed to unseal biometric Hello PIN");
+                None
+            }
+        }
+    }
+
+    async fn delete_biometric_pin(&self, account_id: &str) {
+        let tag = Self::biometric_pin_tag(account_id);
+        let mut dbtxn = self.db.write().await;
+        if let Err(err) = dbtxn.delete_tagged_hsm_key(&tag) {
+            warn!(?err, "Failed to delete biometric Hello PIN");
+            return;
+        }
+        let _ = dbtxn.commit();
+    }
+
+    /// The Unix login name to hand to fprintd (enrollment is keyed by the login
+    /// name, not the Entra UPN).
+    async fn biometric_login_name(&self, account_id: &str) -> Option<String> {
+        match self.get_nssaccount_name(account_id).await {
+            Ok(Some(nss_user)) => Some(nss_user.name),
+            _ => None,
+        }
+    }
+
+    /// Whether a Fingerprint step should be offered at init: enabled, not a
+    /// remote/broker service, a sealed PIN exists, and the user has an enrolled
+    /// fingerprint.
+    async fn biometric_offer_at_init(&self, account_id: &str, service: &str) -> bool {
+        if !self.biometric_hello_enabled || self.hello_totp_enabled {
+            return false;
+        }
+        if service.starts_with("remote:") || service == "broker-interactive" {
+            return false;
+        }
+        if !self.biometric_pin_sealed(account_id).await {
+            return false;
+        }
+        match self.biometric_login_name(account_id).await {
+            Some(name) => fingerprint::has_enrollment(&name).await,
+            None => false,
+        }
+    }
+
+    async fn biometric_verify(&self, account_id: &str) -> FingerprintVerification {
+        match self.biometric_login_name(account_id).await {
+            Some(name) => fingerprint::verify(&name).await,
+            None => FingerprintVerification::Unavailable,
+        }
     }
 
     async fn get_cachestate(&self, account_id: Option<&str>) -> CacheState {
@@ -1770,7 +1901,21 @@ where
                 // Now identify what credentials are needed next. The auth session tells
                 // us this.
 
-                Ok((auth_session, next_req.into()))
+                let response: PamAuthResponse = next_req.into();
+                // Experimental biometric Hello: replace the PIN prompt with a
+                // fingerprint step when eligible. Anything else (MFA, SetupPin,
+                // password) is left untouched.
+                let response = if matches!(response, PamAuthResponse::Pin)
+                    && self.biometric_offer_at_init(account_id, service).await
+                {
+                    PamAuthResponse::Fingerprint {
+                        msg: "Scan your fingerprint to sign in.".to_string(),
+                    }
+                } else {
+                    response
+                };
+
+                Ok((auth_session, response))
             }
             Err(IdpError::NotFound { what, where_ }) => Ok((
                 AuthSession::Denied,
@@ -1790,6 +1935,52 @@ where
         auth_session: &mut AuthSession,
         pam_next_req: PamAuthRequest,
     ) -> ResolverResult<PamAuthResponse> {
+        // Experimental biometric Hello. A Fingerprint step is verified here (in
+        // the trusted daemon, not PAM); on a match the machine-sealed PIN is
+        // unsealed and replayed through the normal PIN path. On any failure we
+        // fall back to a PIN prompt. Capturing account_id as an owned value
+        // first drops the borrow before the main match takes `&mut`.
+        let account_id_for_biometric = match &*auth_session {
+            AuthSession::InProgress { account_id, .. } => Some(account_id.clone()),
+            _ => None,
+        };
+        let mut pam_next_req = pam_next_req;
+        let mut from_biometric = false;
+        if matches!(pam_next_req, PamAuthRequest::Fingerprint) {
+            let Some(account_id) = account_id_for_biometric.clone() else {
+                return Err(ResolverError);
+            };
+            match self.biometric_verify(&account_id).await {
+                FingerprintVerification::Match => {
+                    match self.unseal_biometric_pin(&account_id).await {
+                        Some(pin) => {
+                            pam_next_req = PamAuthRequest::Pin {
+                                cred: pin.to_string(),
+                            };
+                            from_biometric = true;
+                        }
+                        None => return Ok(PamAuthResponse::Pin),
+                    }
+                }
+                FingerprintVerification::NoMatch | FingerprintVerification::Unavailable => {
+                    return Ok(PamAuthResponse::Pin)
+                }
+            }
+        }
+
+        // Capture a freshly-typed PIN so it can be sealed for biometric unlock
+        // after a successful authentication. A biometric-replayed PIN is never
+        // re-sealed.
+        let biometric_seal_cred = if from_biometric {
+            None
+        } else {
+            match &pam_next_req {
+                PamAuthRequest::Pin { cred } => Some(cred.clone()),
+                PamAuthRequest::SetupPin { pin } => Some(pin.clone()),
+                _ => None,
+            }
+        };
+
         let state = match auth_session {
             AuthSession::InProgress {
                 account_id,
@@ -1994,6 +2185,11 @@ where
                     (AuthCredHandler::None, PamAuthRequest::FidoUnavailable) => {
                         return Err(ResolverError);
                     }
+                    (AuthCredHandler::None, PamAuthRequest::Fingerprint) => {
+                        // A Fingerprint request is intercepted and replaced with a
+                        // Pin request before this match, so it never reaches here.
+                        return Err(ResolverError);
+                    }
                     (AuthCredHandler::PasswordFirst { .. }, _) => {
                         // AuthCredHandler::PasswordFirst with anything other than
                         // PamAuthRequest::Password is invalid.
@@ -2038,11 +2234,31 @@ where
                     self.set_cache_usertoken(&mut token).await?;
                     *auth_session = AuthSession::Success(token.spn);
 
+                    // Seal the validated PIN for biometric unlock (best effort;
+                    // never blocks the login). Keyed off the same account_id used
+                    // to offer and unseal, and skipped when TOTP is enabled.
+                    if self.biometric_hello_enabled && !self.hello_totp_enabled {
+                        if let (Some(account_id), Some(cred)) = (
+                            account_id_for_biometric.as_ref(),
+                            biometric_seal_cred.as_ref(),
+                        ) {
+                            self.seal_biometric_pin(account_id, cred).await;
+                        }
+                    }
+
                     Ok(PamAuthResponse::Success)
                 }
             }
             Ok(AuthResult::Denied(msg)) => {
                 *auth_session = AuthSession::Denied;
+                // A biometric-replayed PIN that no longer authenticates (e.g. the
+                // Hello key was rotated or reset) is stale: drop it so we stop
+                // offering fingerprint and fall back to a real PIN prompt.
+                if from_biometric {
+                    if let Some(account_id) = account_id_for_biometric.as_ref() {
+                        self.delete_biometric_pin(account_id).await;
+                    }
+                }
                 Ok(PamAuthResponse::Denied(msg))
             }
             Ok(AuthResult::Next(req)) => Ok(req.into()),

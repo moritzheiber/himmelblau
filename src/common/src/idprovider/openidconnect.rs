@@ -324,6 +324,7 @@ fn pam_auth_request_kind(pam_next_req: &PamAuthRequest) -> &'static str {
         PamAuthRequest::Input { .. } => "input",
         PamAuthRequest::MFAPoll { .. } => "mfa_poll",
         PamAuthRequest::Pin { .. } => "pin",
+        PamAuthRequest::Fingerprint => "fingerprint",
         PamAuthRequest::SetupPin { .. } => "setup_pin",
         PamAuthRequest::HelloTOTP { .. } => "hello_totp",
         PamAuthRequest::Fido { .. } => "fido",

@@ -76,6 +76,13 @@ pub enum PamAuthResponse {
         msg: String,
     },
     Pin,
+    /// PAM must ask the daemon to verify the user's fingerprint. PAM displays
+    /// `msg`, then sends `PamAuthRequest::Fingerprint` to trigger daemon-side
+    /// fprintd verification. Experimental biometric Hello (see
+    /// `enable_experimental_biometric_hello`).
+    Fingerprint {
+        msg: String,
+    },
     /// PAM must generate a Fido assertion
     Fido {
         fido_challenge: String,
@@ -125,6 +132,9 @@ impl PamAuthResponse {
             PamAuthResponse::SetupPin { msg } => PamAuthResponse::SetupPin {
                 msg: i18n::translate_external_message(&msg),
             },
+            PamAuthResponse::Fingerprint { msg } => PamAuthResponse::Fingerprint {
+                msg: i18n::translate_external_message(&msg),
+            },
             PamAuthResponse::ChangePassword { msg } => PamAuthResponse::ChangePassword {
                 msg: i18n::translate_external_message(&msg),
             },
@@ -161,6 +171,10 @@ pub enum PamAuthRequest {
     Pin {
         cred: String,
     },
+    /// PAM asks the daemon to verify the user's fingerprint via fprintd. On a
+    /// match the daemon releases the machine-sealed Hello PIN and completes the
+    /// normal PIN authentication; otherwise it falls back to a PIN prompt.
+    Fingerprint,
     Fido {
         assertion: String,
     },

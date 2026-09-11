@@ -529,6 +529,15 @@ in
       example = true;
     };
 
+    enable_experimental_biometric_hello = mkOption {
+      type = types.nullOr (types.bool);
+      default = false;
+      description = ''
+        Enable the experimental fingerprint-backed Hello proof of concept. After a successful PIN authentication, Himmelblau may provision a separate Hello key protected by a random machine-sealed secret when the PAM user has an enrolled fingerprint. Later local logins try fingerprint verification through fprintd before falling back to the Hello PIN. This proof of concept trusts the privileged daemon and does not support Hello TOTP.
+      '';
+      example = true;
+    };
+
     enable_passwordless_qr_bluetooth = mkOption {
       type = types.nullOr (types.bool);
       default = false;

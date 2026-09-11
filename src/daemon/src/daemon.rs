@@ -47,7 +47,7 @@ use himmelblau_unix_common::resolver::{AuthSession, Resolver};
 use himmelblau_unix_common::unix_config::UidAttr;
 use himmelblau_unix_common::unix_passwd::{parse_etc_group, parse_etc_passwd};
 use himmelblau_unix_common::unix_proto::{
-    ClientRequest, ClientResponse, PamAuthResponse, TaskRequest, TaskResponse,
+    ClientRequest, ClientResponse, PamAuthRequest, PamAuthResponse, TaskRequest, TaskResponse,
 };
 use himmelblau_unix_common::user_map::UserMap;
 use himmelblau_unix_common::{tpm_init, tpm_loadable_machine_key, tpm_machine_key};
@@ -544,10 +544,20 @@ async fn handle_client(
                 .await
             }
             ClientRequest::PamAuthenticateStep(pam_next_req) => {
-                let span = span!(Level::INFO, "pam authenticate step");
-                async {
-                    trace!("pam authenticate step");
-                    match &mut pam_auth_session_state {
+                // Biometric Hello authorization must come from a root peer (the
+                // PAM stack). A non-root peer cannot drive fprintd verification;
+                // fall back to a PIN prompt.
+                if matches!(&pam_next_req, PamAuthRequest::Fingerprint) && ucred.uid() != 0 {
+                    warn!(
+                        peer_uid = ucred.uid(),
+                        "Refusing biometric Hello verification for non-root peer"
+                    );
+                    PamAuthResponse::Pin.into()
+                } else {
+                    let span = span!(Level::INFO, "pam authenticate step");
+                    async {
+                        trace!("pam authenticate step");
+                        match &mut pam_auth_session_state {
                         Some(auth_session) => {
                             match cachelayer
                                 .pam_account_authenticate_step(auth_session, pam_next_req)
@@ -850,6 +860,7 @@ async fn handle_client(
                 }
                 .instrument(span)
                 .await
+                }
             }
             ClientRequest::PamAccountAllowed(account_id) => {
                 let account_id = account_id.to_lowercase();
@@ -2041,6 +2052,8 @@ async fn main() -> ExitCode {
                 UidAttr::Name,
                 UidAttr::Name,
                 user_map.get_id_overrides(),
+                cfg.get_enable_experimental_biometric_hello(),
+                cfg.get_enable_hello_totp(),
             )
             .await
             {

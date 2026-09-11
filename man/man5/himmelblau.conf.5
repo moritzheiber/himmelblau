@@ -1,4 +1,4 @@
-.TH HIMMELBLAU.CONF "5" "August 2026" "Himmelblau Configuration" "File Formats"
+.TH HIMMELBLAU.CONF "5" "September 2026" "Himmelblau Configuration" "File Formats"
 .SH NAME
 himmelblau.conf \- Configuration file for Himmelblau, enabling Azure Entra ID authentication on Linux.
 
@@ -638,6 +638,17 @@ Default: false
 
 .P
 Example: enable_experimental_passwordless_fido = true
+
+.TP
+.B enable_experimental_biometric_hello
+.RE
+Enable the experimental fingerprint-backed Hello proof of concept. After a successful PIN authentication, Himmelblau may provision a separate Hello key protected by a random machine-sealed secret when the PAM user has an enrolled fingerprint. Later local logins try fingerprint verification through fprintd before falling back to the Hello PIN. This proof of concept trusts the privileged daemon and does not support Hello TOTP.
+
+.P
+Default: false
+
+.P
+Example: enable_experimental_biometric_hello = true
 
 .TP
 .B enable_passwordless_qr_bluetooth

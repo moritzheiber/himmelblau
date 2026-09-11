@@ -1120,6 +1120,17 @@ fn handle_pam_auth_response_pin(state: &mut AuthenticateState) -> PamWhatNext {
     PamWhatNext::Next(req)
 }
 
+fn handle_pam_auth_response_fingerprint(state: &AuthenticateState, msg: &str) -> PamWhatNext {
+    // Verification happens in the daemon (fprintd is owned by the trusted
+    // process, not this PAM module). PAM only surfaces the prompt and relays a
+    // go-ahead; the daemon reports the match result on the next step.
+    state
+        .msg_printer
+        .print_text(&i18n::translate_external_message(msg));
+    let req = ClientRequest::PamAuthenticateStep(PamAuthRequest::Fingerprint);
+    PamWhatNext::Next(req)
+}
+
 fn fido_auth_qr_bluetooth_only(
     msg_printer: Arc<dyn MessagePrinter>,
     fido_challenge: String,
@@ -1369,6 +1380,7 @@ fn authenticate_request_response(
         PamAuthResponse::MFAPollWait => handle_pam_auth_response_mfapollwait(state),
         PamAuthResponse::SetupPin { msg } => handle_pam_auth_response_setup_pin(state, &msg),
         PamAuthResponse::Pin => handle_pam_auth_response_pin(state),
+        PamAuthResponse::Fingerprint { msg } => handle_pam_auth_response_fingerprint(state, &msg),
         PamAuthResponse::Fido {
             fido_challenge,
             fido_allow_list,

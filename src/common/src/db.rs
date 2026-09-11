@@ -552,6 +552,7 @@ impl<'a> CacheTxn for DbTxn<'a> {
                 "DELETE FROM hsm_data_t
                  WHERE key LIKE '%/hello'
                     OR key LIKE '%/hello_decoupled'
+                    OR key LIKE '%/hello_biometric_pin'
                     OR key LIKE '%/hello_prt'
                     OR key LIKE '%/hello_refresh_token'
                     OR key LIKE '%/hello_totp'",
@@ -1118,6 +1119,7 @@ mod tests {
         let hello_keys = [
             "testuser@example.com/hello",
             "testuser@example.com/hello_decoupled",
+            "testuser@example.com/hello_biometric_pin",
             "testuser@example.com/hello_prt",
             "testuser@example.com/hello_refresh_token",
             "testuser@example.com/hello_totp",
